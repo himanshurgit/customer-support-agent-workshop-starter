@@ -108,6 +108,7 @@ Customer -> API Gateway -> Lambda -> Bedrock AgentCore Runtime
 
 ## Cleanup
 
-Several resources cost money if left running — especially the OpenSearch Serverless
-collection behind the Knowledge Base. The final workshop module walks through deleting
-everything. Always tear down your workshop resources when you are done.
+This workshop backs the Knowledge Base with **Amazon S3 Vectors**, which costs cents
+for a workshop-sized dataset — there is no expensive OpenSearch Serverless vector store
+to worry about. The final workshop module still walks through deleting everything;
+always tear down your workshop resources when you are done.
