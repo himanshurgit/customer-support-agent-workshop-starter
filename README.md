@@ -14,10 +14,10 @@ macOS, or Linux**.
 
 ## Prerequisites
 
-- **Python 3.11+**
-- **AWS CLI v2**, configured with a profile that has `AdministratorAccess`
-- An **AWS account with Amazon Bedrock model access** enabled for Claude Sonnet 4
-  and Titan Embeddings V2 (in `us-east-1`)
+- **Python 3.13+**
+- **AWS CLI v2**, configured via AWS IAM Identity Center (SSO) with a profile that has `AdministratorAccess`
+- An **AWS account with Amazon Bedrock available** — foundation models (Claude Sonnet 4.6
+  and Titan Embeddings V2) are enabled by default in `us-east-1`
 - **Git** (optional — there is a no-Git download path below)
 - **Windows users:** run everything in **Git Bash** (installed with
   [Git for Windows](https://git-scm.com/download/win)) from the
@@ -97,7 +97,7 @@ work on AWS Lambda regardless of the OS that created them.
 
 ```
 Customer -> API Gateway -> Lambda -> Bedrock AgentCore Runtime
-                                     |-- Claude (claude-sonnet-4-6)
+                                     |-- Claude Sonnet 4.6 (anthropic.claude-sonnet-4-6)
                                      |-- Memory   (remembers customers across sessions)
                                      |-- Knowledge Base (RAG over your S3 docs)
                                      |-- tool: create_ticket    -> Lambda -> DynamoDB
