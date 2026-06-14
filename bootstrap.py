@@ -445,7 +445,7 @@ def build_agent(customer_id: str = None):
         }
 
     model = BedrockModel(
-        model_id="us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+        model_id="anthropic.claude-sonnet-4-6",
         region_name=REGION,
         guardrail_config=guardrail_config,
     )
