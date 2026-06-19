@@ -329,7 +329,7 @@ def search_knowledge_base(query: str) -> str:
 
         chunks = []
         for r in results:
-            if r.get("score", 0) > 0.4:
+            if r.get("score", 0) > 0.3:
                 chunks.append(r["content"]["text"])
 
         return "\\n\\n---\\n\\n".join(chunks) if chunks else "No sufficiently relevant documentation found."
