@@ -677,6 +677,107 @@ for label, message in TESTS:
 print("====== ALL TESTS COMPLETE ======")
 '''
 
+# ── web/index.html (optional local chat demo — Module 09) ─────────────────
+FILES["web/index.html"] = '''\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Support Agent — Chat Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 640px; margin: 0 auto; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 16px; border-bottom: 1px solid #1e293b; }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
+    .url-row { padding: 12px 16px; border-bottom: 1px solid #1e293b; }
+    .url-row input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 13px; }
+    #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 14px; line-height: 1.45; white-space: pre-wrap; }
+    .me { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 4px; }
+    .bot { align-self: flex-start; background: #1e293b; border-bottom-left-radius: 4px; }
+    .typing { font-style: italic; color: #94a3b8; }
+    form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #1e293b; }
+    #box { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 14px; }
+    button { padding: 10px 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Support Agent</h1>
+      <p>Local demo page — talks to your /chat endpoint on AWS.</p>
+    </header>
+    <div class="url-row">
+      <input id="api" placeholder="Paste your API URL, e.g. https://XXXX.execute-api.us-east-1.amazonaws.com/prod" />
+    </div>
+    <div id="log">
+      <div class="msg bot">Hi! Ask me about password resets or API limits, or tell me to create a support ticket.</div>
+    </div>
+    <form id="form">
+      <input id="box" placeholder="Type a message..." autocomplete="off" />
+      <button id="send" type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    var EMAIL = "demo@example.com";
+    var log = document.getElementById("log");
+    var form = document.getElementById("form");
+    var box = document.getElementById("box");
+    var send = document.getElementById("send");
+    var api = document.getElementById("api");
+
+    function add(text, cls) {
+      var div = document.createElement("div");
+      div.className = "msg " + cls;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var message = box.value.trim();
+      var url = api.value.trim().replace(/[/]+$/, "");
+      if (!message) return;
+      if (!url) { add("Paste your API URL in the box at the top first.", "bot"); return; }
+
+      add(message, "me");
+      box.value = "";
+      send.disabled = true;
+      var typing = add("typing...", "bot typing");
+
+      // No Content-Type header is set, so the browser sends the body as
+      // text/plain and treats this as a "simple" cross-origin request — it
+      // skips the CORS preflight. The Lambda json.loads the body regardless.
+      fetch(url + "/chat", {
+        method: "POST",
+        body: JSON.stringify({ message: message, customer_id: EMAIL })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          typing.remove();
+          add(data.response || JSON.stringify(data), "bot");
+        })
+        .catch(function (err) {
+          typing.remove();
+          add("Error: " + err.message + " — check the API URL is correct.", "bot");
+        })
+        .finally(function () {
+          send.disabled = false;
+          box.focus();
+        });
+    });
+  </script>
+</body>
+</html>
+'''
+
 # ── README.md (orientation for anyone who clones the repo directly) ─────────
 FILES["README.md"] = """\
 # Support Agent Workshop — Starter
