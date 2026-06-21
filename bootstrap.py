@@ -18,24 +18,23 @@ import sys
 FILES = {}
 
 # ── requirements.txt ───────────────────────────────────────────────────────
-FILES["requirements.txt"] = """\
-strands-agents>=0.1.0
-strands-agents-tools>=0.1.0
-boto3>=1.38.0
-python-dotenv>=1.0.0
-"""
+FILES["requirements.txt"] = '''\
+strands-agents==1.43.0
+strands-agents-tools==0.8.0
+boto3==1.43.29
+python-dotenv==1.2.2
+'''
 
 # ── .env (filled in as the learner progresses) ─────────────────────────────
-FILES[".env"] = """\
+FILES[".env"] = '''\
 AWS_REGION=us-east-1
 TICKET_TABLE_NAME=support-tickets
 
 # Filled in as you complete each module:
 KNOWLEDGE_BASE_ID=
-MEMORY_ID=
 GUARDRAIL_ID=
 GUARDRAIL_VERSION=DRAFT
-"""
+'''
 
 # ── docs/product-guide.txt ─────────────────────────────────────────────────
 FILES["docs/product-guide.txt"] = """\
@@ -290,6 +289,7 @@ FILES["agent.py"] = '''\
 import json, os, boto3
 from strands import Agent, tool
 from strands.models import BedrockModel
+from strands.session import S3SessionManager
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -300,6 +300,9 @@ TICKET_TABLE      = os.getenv("TICKET_TABLE_NAME", "support-tickets")
 
 GUARDRAIL_ID      = os.getenv("GUARDRAIL_ID", "")
 GUARDRAIL_VERSION = os.getenv("GUARDRAIL_VERSION", "DRAFT")
+
+# Cross-session memory is stored under sessions/ in the docs S3 bucket.
+SESSION_BUCKET    = os.getenv("DOCS_BUCKET", "")
 
 lambda_client = boto3.client("lambda",                region_name=REGION)
 kb_client     = boto3.client("bedrock-agent-runtime", region_name=REGION)
@@ -435,38 +438,32 @@ Rules:
 # -- Build the Agent ---------------------------------------------------------
 
 def build_agent(customer_id: str = None):
-    """customer_id scopes memory per customer (use email or user id)."""
-    guardrail_config = None
+    """Build the support agent. customer_id identifies the conversation."""
+    model_kwargs = {
+        "model_id": "anthropic.claude-sonnet-4-6",
+        "region_name": REGION,
+    }
     if GUARDRAIL_ID:
-        guardrail_config = {
-            "guardrailIdentifier": GUARDRAIL_ID,
-            "guardrailVersion":    GUARDRAIL_VERSION,
-            "trace":               "enabled",
-        }
+        model_kwargs["guardrail_id"] = GUARDRAIL_ID
+        model_kwargs["guardrail_version"] = GUARDRAIL_VERSION
+        model_kwargs["guardrail_trace"] = "enabled"
 
-    model = BedrockModel(
-        model_id="anthropic.claude-sonnet-4-6",
-        region_name=REGION,
-        guardrail_config=guardrail_config,
-    )
+    model = BedrockModel(**model_kwargs)
 
-    memory = None
-    if os.getenv("MEMORY_ID") and customer_id:
-        try:
-            from strands.memory import BedrockAgentCoreMemory
-            memory = BedrockAgentCoreMemory(
-                memory_id=os.getenv("MEMORY_ID"),
-                session_id=customer_id,
-                region_name=REGION,
-            )
-        except Exception as e:
-            print(f"Memory disabled: {e}")
+    session_manager = None
+    if customer_id and SESSION_BUCKET:
+        session_manager = S3SessionManager(
+            session_id=customer_id,
+            bucket=SESSION_BUCKET,
+            prefix="sessions/",
+            region_name=REGION,
+        )
 
     return Agent(
         model=model,
         tools=[search_knowledge_base, create_ticket, escalate_to_human],
         system_prompt=SYSTEM_PROMPT,
-        memory=memory,
+        session_manager=session_manager,
     )
 
 
@@ -593,39 +590,19 @@ for result in response["retrievalResults"]:
     print("---")
 '''
 
-# ── scripts/create_memory.py ───────────────────────────────────────────────
-FILES["scripts/create_memory.py"] = '''\
-import boto3, os
-from dotenv import load_dotenv
-
-load_dotenv()
-REGION = os.getenv("AWS_REGION", "us-east-1")
-
-agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
-
-response = agentcore.create_memory(
-    name="support-agent-memory",
-    description="Long-term memory for the support agent - stores customer plan, issues, and preferences",
-    memoryConfiguration={
-        "extractionConfiguration": {
-            "type": "SEMANTIC",
-        },
-        "retentionDays": 90,
-    },
-)
-
-memory_id = response["memoryId"]
-print(f"Memory store created: {memory_id}")
-print(f"Add to .env: MEMORY_ID={memory_id}")
-'''
-
 # ── test_memory.py (project root — imports agent.py) ───────────────────────
 FILES["test_memory.py"] = '''\
 import os
-from agent import build_agent   # lives at project root alongside this script
+from agent import build_agent, SESSION_BUCKET   # lives at project root alongside this script
 from dotenv import load_dotenv
 
 load_dotenv()
+
+if not SESSION_BUCKET:
+    raise SystemExit(
+        "DOCS_BUCKET is not set, so memory cannot persist to S3.\\n"
+        "Run 'source scripts/set-env.sh' in this terminal first, then re-run."
+    )
 
 CUSTOMER = "alice@example.com"
 
@@ -638,7 +615,7 @@ print("\\n=== Session 2 (new agent instance, same customer) ===")
 agent2 = build_agent(customer_id=CUSTOMER)
 r2 = agent2("Hi, any updates on my API issue?")
 print(f"Agent: {r2}")
-# The agent should recall Enterprise plan and rate limit context from Session 1
+# The agent should recall the Enterprise plan and rate limit context from Session 1
 '''
 
 # ── scripts/test_runner.py ─────────────────────────────────────────────────
