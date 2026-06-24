@@ -440,7 +440,7 @@ Rules:
 def build_agent(customer_id: str = None):
     """Build the support agent. customer_id identifies the conversation."""
     model_kwargs = {
-        "model_id": "anthropic.claude-sonnet-4-6",
+        "model_id": "qwen.qwen3-32b-v1:0",
         "region_name": REGION,
     }
     if GUARDRAIL_ID:
@@ -760,7 +760,7 @@ FILES["README.md"] = """\
 # Support Agent Workshop — Starter
 
 Scaffold for the **Build an AI Customer Support Agent on AWS** workshop
-(Amazon Bedrock AgentCore + Claude).
+(Amazon Bedrock AgentCore + Claude/Qwen models).
 
 ## Quick start
 
