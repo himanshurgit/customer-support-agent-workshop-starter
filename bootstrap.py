@@ -18,12 +18,14 @@ import sys
 FILES = {}
 
 # ── requirements.txt ───────────────────────────────────────────────────────
-FILES["requirements.txt"] = '''\
+FILES["requirements.txt"] = """\
 strands-agents==1.43.0
 strands-agents-tools==0.8.0
+bedrock-agentcore==1.15.0
+bedrock-agentcore-starter-toolkit==0.3.9
 boto3==1.43.29
 python-dotenv==1.2.2
-'''
+"""
 
 # ── .env (filled in as the learner progresses) ─────────────────────────────
 FILES[".env"] = '''\
@@ -176,12 +178,13 @@ Please respond within {"1 hour" if urgency == "urgent" else "4 hours"}.
 
 # ── lambda/api-handler/index.py ────────────────────────────────────────────
 FILES["lambda/api-handler/index.py"] = '''\
-import json, os, sys
+import json, os, uuid, boto3
 
-# Include the agent module — build_api_lambda.py packages agent.py alongside this file
-sys.path.insert(0, "/var/task")
+REGION    = os.getenv("AWS_REGION", "us-east-1")
+AGENT_ARN = os.environ["AGENT_ARN"]   # the deployed runtime ARN (from 'agentcore status')
 
-from agent import build_agent
+# The bedrock-agentcore data-plane client invokes the deployed AgentCore Runtime.
+agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
 
 def handler(event, context):
     try:
@@ -192,11 +195,25 @@ def handler(event, context):
         if not message:
             return _response(400, {"error": "message is required"})
 
-        agent = build_agent(customer_id=customer_id)
-        result = agent(message)
+        # runtimeSessionId groups a customer's calls; AgentCore requires 33+ chars.
+        session_id = f"{customer_id}-{uuid.uuid4().hex}"
+
+        resp = agentcore.invoke_agent_runtime(
+            agentRuntimeArn=AGENT_ARN,
+            runtimeSessionId=session_id,
+            qualifier="DEFAULT",
+            payload=json.dumps({
+                "prompt":      message,
+                "customer_id": customer_id,
+            }).encode(),
+        )
+
+        # The runtime streams its JSON response back in chunks — reassemble it.
+        chunks = [c.decode("utf-8") for c in resp.get("response", [])]
+        answer = json.loads("".join(chunks))
 
         return _response(200, {
-            "response":    str(result),
+            "response":    answer.get("result", ""),
             "customer_id": customer_id,
         })
 
@@ -242,6 +259,19 @@ FILES["infra/lambda-permissions.json"] = '''\
       "Effect": "Allow",
       "Action": "sns:Publish",
       "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::support-agent-docs-*",
+        "arn:aws:s3:::support-agent-docs-*/sessions/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:InvokeAgentRuntime"],
+      "Resource": "arn:aws:bedrock-agentcore:us-east-1:*:runtime/*"
     }
   ]
 }
@@ -253,7 +283,7 @@ FILES["infra/agentcore-trust-policy.json"] = '''\
   "Version": "2012-10-17",
   "Statement": [{
     "Effect": "Allow",
-    "Principal": { "Service": "bedrock.amazonaws.com" },
+    "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
     "Action": "sts:AssumeRole"
   }]
 }
@@ -265,19 +295,49 @@ FILES["infra/agentcore-permissions.json"] = '''\
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ModelInvocation",
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
       "Resource": "*"
     },
-    { "Effect": "Allow", "Action": ["bedrock:Retrieve"], "Resource": "*" },
+    { "Sid": "KnowledgeBaseRetrieve", "Effect": "Allow", "Action": ["bedrock:Retrieve"], "Resource": "*" },
     {
+      "Sid": "InvokeToolLambdas",
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": "arn:aws:lambda:us-east-1:*:function:support-*"
     },
     {
+      "Sid": "SessionMemoryS3",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::support-agent-docs-*",
+        "arn:aws:s3:::support-agent-docs-*/sessions/*"
+      ]
+    },
+    {
+      "Sid": "RuntimeLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams", "logs:DescribeLogGroups"],
+      "Resource": "arn:aws:logs:us-east-1:*:log-group:/aws/bedrock-agentcore/*"
+    },
+    {
+      "Sid": "RuntimeImagePull",
+      "Effect": "Allow",
+      "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:GetAuthorizationToken"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RuntimeTelemetry",
+      "Effect": "Allow",
+      "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets", "cloudwatch:PutMetricData"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WorkloadIdentity",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:GetWorkloadAccessToken", "bedrock-agentcore:GetWorkloadAccessTokenForJWT", "bedrock-agentcore:GetWorkloadAccessTokenForUserId"],
       "Resource": "*"
     }
   ]
@@ -290,6 +350,7 @@ import json, os, boto3
 from strands import Agent, tool
 from strands.models import BedrockModel
 from strands.session import S3SessionManager
+from bedrock_agentcore import BedrockAgentCoreApp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -467,17 +528,25 @@ def build_agent(customer_id: str = None):
     )
 
 
-# -- Local interactive test --------------------------------------------------
+# -- AgentCore Runtime entrypoint --------------------------------------------
+# BedrockAgentCoreApp wraps the agent in the HTTP contract AgentCore Runtime
+# expects (POST /invocations on port 8080). The same app runs locally and in
+# the cloud — what you test with 'python agent.py' is exactly what gets deployed.
+
+app = BedrockAgentCoreApp()
+
+
+@app.entrypoint
+def invoke(payload):
+    """Runs on every request. 'payload' is the JSON body sent to the runtime."""
+    message     = payload.get("prompt", "")
+    customer_id = payload.get("customer_id")   # scopes cross-session memory per customer
+    result = build_agent(customer_id=customer_id)(message)
+    return {"result": str(result)}
+
 
 if __name__ == "__main__":
-    agent = build_agent()
-    print("Agent ready. Type 'quit' to exit.\\n")
-    while True:
-        user_input = input("You: ").strip()
-        if user_input.lower() in ("quit", "exit"):
-            break
-        response = agent(user_input)
-        print(f"\\nAgent: {response}\\n")
+    app.run()   # serves the agent on http://localhost:8080 for local testing
 '''
 
 # ── scripts/set-env.sh ─────────────────────────────────────────────────────
@@ -495,6 +564,11 @@ export TICKET_TABLE_NAME="support-tickets"
 # Uncomment and fill in as you create these resources:
 # export KNOWLEDGE_BASE_ID="XXXXXXXXXX"
 # export SNS_TOPIC_ARN="arn:aws:sns:us-east-1:...:support-escalations"
+# export LAMBDA_ROLE_ARN="arn:aws:iam::...:role/SupportAgentLambdaRole"
+# export AGENTCORE_ROLE_ARN="arn:aws:iam::...:role/SupportAgentCoreRole"
+# export AGENT_ARN="arn:aws:bedrock-agentcore:us-east-1:...:runtime/support_agent-XXXXXX"
+# export GUARDRAIL_ID="XXXXXXXXXX"
+# export GUARDRAIL_VERSION="DRAFT"
 
 echo "Region : $AWS_REGION"
 echo "Account: $AWS_ACCOUNT_ID"
@@ -529,7 +603,7 @@ if __name__ == "__main__":
 # ── scripts/build_api_lambda.py ────────────────────────────────────────────
 FILES["scripts/build_api_lambda.py"] = '''\
 #!/usr/bin/env python3
-"""Bundle the API handler + agent.py + dependencies into function.zip.
+"""Bundle the API handler + a current boto3 into function.zip.
 Cross-platform — no cp, no zip, no shell. Run: python scripts/build_api_lambda.py"""
 import os, shutil, subprocess, sys, zipfile
 
@@ -542,15 +616,13 @@ ZIP   = os.path.join(SRC, "function.zip")
 shutil.rmtree(BUILD, ignore_errors=True)
 os.makedirs(BUILD)
 
-# 2. Copy handler + agent.py (shutil.copy works on every OS)
+# 2. Copy just the handler — the agent lives in AgentCore Runtime, not here.
 shutil.copy(os.path.join(SRC, "index.py"), BUILD)
-shutil.copy(os.path.join(ROOT, "agent.py"), BUILD)
 
-# 3. Install dependencies into the build dir
+# 3. Bundle a current boto3 so invoke_agent_runtime is available
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
-    "strands-agents", "strands-agents-tools", "boto3", "python-dotenv",
-    "--target", BUILD,
+    "boto3", "--target", BUILD,
 ])
 
 # 4. Zip everything at the build-dir root (flat — Lambda requirement)
