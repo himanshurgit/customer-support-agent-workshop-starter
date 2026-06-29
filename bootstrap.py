@@ -19,10 +19,12 @@ FILES = {}
 
 # ── requirements.txt ───────────────────────────────────────────────────────
 FILES["requirements.txt"] = """\
-strands-agents>=0.1.0
-strands-agents-tools>=0.1.0
-boto3>=1.38.0
-python-dotenv>=1.0.0
+strands-agents==1.43.0
+strands-agents-tools==0.8.0
+bedrock-agentcore==1.15.0
+bedrock-agentcore-starter-toolkit==0.3.9
+boto3==1.43.29
+python-dotenv==1.2.2
 """
 
 # ── .env (filled in as the learner progresses) ─────────────────────────────
@@ -177,12 +179,13 @@ Please respond within {"1 hour" if urgency == "urgent" else "4 hours"}.
 
 # ── lambda/api-handler/index.py ────────────────────────────────────────────
 FILES["lambda/api-handler/index.py"] = '''\
-import json, os, sys
+import json, os, uuid, boto3
 
-# Include the agent module — build_api_lambda.py packages agent.py alongside this file
-sys.path.insert(0, "/var/task")
+REGION    = os.getenv("AWS_REGION", "us-east-1")
+AGENT_ARN = os.environ["AGENT_ARN"]   # the deployed runtime ARN (from 'agentcore status')
 
-from agent import build_agent
+# The bedrock-agentcore data-plane client invokes the deployed AgentCore Runtime.
+agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
 
 def handler(event, context):
     try:
@@ -193,11 +196,25 @@ def handler(event, context):
         if not message:
             return _response(400, {"error": "message is required"})
 
-        agent = build_agent(customer_id=customer_id)
-        result = agent(message)
+        # runtimeSessionId groups a customer's calls; AgentCore requires 33+ chars.
+        session_id = f"{customer_id}-{uuid.uuid4().hex}"
+
+        resp = agentcore.invoke_agent_runtime(
+            agentRuntimeArn=AGENT_ARN,
+            runtimeSessionId=session_id,
+            qualifier="DEFAULT",
+            payload=json.dumps({
+                "prompt":      message,
+                "customer_id": customer_id,
+            }).encode(),
+        )
+
+        # The runtime streams its JSON response back in chunks — reassemble it.
+        chunks = [c.decode("utf-8") for c in resp.get("response", [])]
+        answer = json.loads("".join(chunks))
 
         return _response(200, {
-            "response":    str(result),
+            "response":    answer.get("result", ""),
             "customer_id": customer_id,
         })
 
@@ -243,6 +260,19 @@ FILES["infra/lambda-permissions.json"] = '''\
       "Effect": "Allow",
       "Action": "sns:Publish",
       "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::support-agent-docs-*",
+        "arn:aws:s3:::support-agent-docs-*/sessions/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:InvokeAgentRuntime"],
+      "Resource": "arn:aws:bedrock-agentcore:us-east-1:*:runtime/*"
     }
   ]
 }
@@ -254,7 +284,7 @@ FILES["infra/agentcore-trust-policy.json"] = '''\
   "Version": "2012-10-17",
   "Statement": [{
     "Effect": "Allow",
-    "Principal": { "Service": "bedrock.amazonaws.com" },
+    "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
     "Action": "sts:AssumeRole"
   }]
 }
@@ -266,19 +296,49 @@ FILES["infra/agentcore-permissions.json"] = '''\
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "ModelInvocation",
       "Effect": "Allow",
       "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
       "Resource": "*"
     },
-    { "Effect": "Allow", "Action": ["bedrock:Retrieve"], "Resource": "*" },
+    { "Sid": "KnowledgeBaseRetrieve", "Effect": "Allow", "Action": ["bedrock:Retrieve"], "Resource": "*" },
     {
+      "Sid": "InvokeToolLambdas",
       "Effect": "Allow",
       "Action": ["lambda:InvokeFunction"],
       "Resource": "arn:aws:lambda:us-east-1:*:function:support-*"
     },
     {
+      "Sid": "SessionMemoryS3",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::support-agent-docs-*",
+        "arn:aws:s3:::support-agent-docs-*/sessions/*"
+      ]
+    },
+    {
+      "Sid": "RuntimeLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams", "logs:DescribeLogGroups"],
+      "Resource": "arn:aws:logs:us-east-1:*:log-group:/aws/bedrock-agentcore/*"
+    },
+    {
+      "Sid": "RuntimeImagePull",
+      "Effect": "Allow",
+      "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:GetAuthorizationToken"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RuntimeTelemetry",
+      "Effect": "Allow",
+      "Action": ["xray:PutTraceSegments", "xray:PutTelemetryRecords", "xray:GetSamplingRules", "xray:GetSamplingTargets", "cloudwatch:PutMetricData"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WorkloadIdentity",
+      "Effect": "Allow",
+      "Action": ["bedrock-agentcore:GetWorkloadAccessToken", "bedrock-agentcore:GetWorkloadAccessTokenForJWT", "bedrock-agentcore:GetWorkloadAccessTokenForUserId"],
       "Resource": "*"
     }
   ]
@@ -290,6 +350,8 @@ FILES["agent.py"] = '''\
 import json, os, boto3
 from strands import Agent, tool
 from strands.models import BedrockModel
+from strands.session import S3SessionManager
+from bedrock_agentcore import BedrockAgentCoreApp
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -300,6 +362,9 @@ TICKET_TABLE      = os.getenv("TICKET_TABLE_NAME", "support-tickets")
 
 GUARDRAIL_ID      = os.getenv("GUARDRAIL_ID", "")
 GUARDRAIL_VERSION = os.getenv("GUARDRAIL_VERSION", "DRAFT")
+
+# Cross-session memory is stored under sessions/ in the docs S3 bucket.
+SESSION_BUCKET    = os.getenv("DOCS_BUCKET", "")
 
 lambda_client = boto3.client("lambda",                region_name=REGION)
 kb_client     = boto3.client("bedrock-agent-runtime", region_name=REGION)
@@ -329,7 +394,7 @@ def search_knowledge_base(query: str) -> str:
 
         chunks = []
         for r in results:
-            if r.get("score", 0) > 0.4:
+            if r.get("score", 0) > 0.3:
                 chunks.append(r["content"]["text"])
 
         return "\\n\\n---\\n\\n".join(chunks) if chunks else "No sufficiently relevant documentation found."
@@ -435,52 +500,54 @@ Rules:
 # -- Build the Agent ---------------------------------------------------------
 
 def build_agent(customer_id: str = None):
-    """customer_id scopes memory per customer (use email or user id)."""
-    guardrail_config = None
+    """Build the support agent. customer_id identifies the conversation."""
+    model_kwargs = {
+        "model_id": "qwen.qwen3-32b-v1:0",
+        "region_name": REGION,
+    }
     if GUARDRAIL_ID:
-        guardrail_config = {
-            "guardrailIdentifier": GUARDRAIL_ID,
-            "guardrailVersion":    GUARDRAIL_VERSION,
-            "trace":               "enabled",
-        }
+        model_kwargs["guardrail_id"] = GUARDRAIL_ID
+        model_kwargs["guardrail_version"] = GUARDRAIL_VERSION
+        model_kwargs["guardrail_trace"] = "enabled"
 
-    model = BedrockModel(
-        model_id="anthropic.claude-sonnet-4-6",
-        region_name=REGION,
-        guardrail_config=guardrail_config,
-    )
+    model = BedrockModel(**model_kwargs)
 
-    memory = None
-    if os.getenv("MEMORY_ID") and customer_id:
-        try:
-            from strands.memory import BedrockAgentCoreMemory
-            memory = BedrockAgentCoreMemory(
-                memory_id=os.getenv("MEMORY_ID"),
-                session_id=customer_id,
-                region_name=REGION,
-            )
-        except Exception as e:
-            print(f"Memory disabled: {e}")
+    session_manager = None
+    if customer_id and SESSION_BUCKET:
+        session_manager = S3SessionManager(
+            session_id=customer_id,
+            bucket=SESSION_BUCKET,
+            prefix="sessions/",
+            region_name=REGION,
+        )
 
     return Agent(
         model=model,
         tools=[search_knowledge_base, create_ticket, escalate_to_human],
         system_prompt=SYSTEM_PROMPT,
-        memory=memory,
+        session_manager=session_manager,
     )
 
 
-# -- Local interactive test --------------------------------------------------
+# -- AgentCore Runtime entrypoint --------------------------------------------
+# BedrockAgentCoreApp wraps the agent in the HTTP contract AgentCore Runtime
+# expects (POST /invocations on port 8080). The same app runs locally and in
+# the cloud — what you test with 'python agent.py' is exactly what gets deployed.
+
+app = BedrockAgentCoreApp()
+
+
+@app.entrypoint
+def invoke(payload):
+    """Runs on every request. 'payload' is the JSON body sent to the runtime."""
+    message     = payload.get("prompt", "")
+    customer_id = payload.get("customer_id")   # scopes cross-session memory per customer
+    result = build_agent(customer_id=customer_id)(message)
+    return {"result": str(result)}
+
 
 if __name__ == "__main__":
-    agent = build_agent()
-    print("Agent ready. Type 'quit' to exit.\\n")
-    while True:
-        user_input = input("You: ").strip()
-        if user_input.lower() in ("quit", "exit"):
-            break
-        response = agent(user_input)
-        print(f"\\nAgent: {response}\\n")
+    app.run()   # serves the agent on http://localhost:8080 for local testing
 '''
 
 # ── scripts/set-env.sh ─────────────────────────────────────────────────────
@@ -498,6 +565,11 @@ export TICKET_TABLE_NAME="support-tickets"
 # Uncomment and fill in as you create these resources:
 # export KNOWLEDGE_BASE_ID="XXXXXXXXXX"
 # export SNS_TOPIC_ARN="arn:aws:sns:us-east-1:...:support-escalations"
+# export LAMBDA_ROLE_ARN="arn:aws:iam::...:role/SupportAgentLambdaRole"
+# export AGENTCORE_ROLE_ARN="arn:aws:iam::...:role/SupportAgentCoreRole"
+# export AGENT_ARN="arn:aws:bedrock-agentcore:us-east-1:...:runtime/support_agent-XXXXXX"
+# export GUARDRAIL_ID="XXXXXXXXXX"
+# export GUARDRAIL_VERSION="DRAFT"
 
 echo "Region : $AWS_REGION"
 echo "Account: $AWS_ACCOUNT_ID"
@@ -532,7 +604,7 @@ if __name__ == "__main__":
 # ── scripts/build_api_lambda.py ────────────────────────────────────────────
 FILES["scripts/build_api_lambda.py"] = '''\
 #!/usr/bin/env python3
-"""Bundle the API handler + agent.py + dependencies into function.zip.
+"""Bundle the API handler + a current boto3 into function.zip.
 Cross-platform — no cp, no zip, no shell. Run: python scripts/build_api_lambda.py"""
 import os, shutil, subprocess, sys, zipfile
 
@@ -545,15 +617,13 @@ ZIP   = os.path.join(SRC, "function.zip")
 shutil.rmtree(BUILD, ignore_errors=True)
 os.makedirs(BUILD)
 
-# 2. Copy handler + agent.py (shutil.copy works on every OS)
+# 2. Copy just the handler — the agent lives in AgentCore Runtime, not here.
 shutil.copy(os.path.join(SRC, "index.py"), BUILD)
-shutil.copy(os.path.join(ROOT, "agent.py"), BUILD)
 
-# 3. Install dependencies into the build dir
+# 3. Bundle a current boto3 so invoke_agent_runtime is available
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
-    "strands-agents", "strands-agents-tools", "boto3", "python-dotenv",
-    "--target", BUILD,
+    "boto3", "--target", BUILD,
 ])
 
 # 4. Zip everything at the build-dir root (flat — Lambda requirement)
@@ -675,6 +745,107 @@ for label, message in TESTS:
     print(f"====== {label} ======")
     ask(message)
 print("====== ALL TESTS COMPLETE ======")
+'''
+
+# ── web/index.html (optional local chat demo — Module 09) ─────────────────
+FILES["web/index.html"] = '''\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Support Agent — Chat Demo</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 640px; margin: 0 auto; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 16px; border-bottom: 1px solid #1e293b; }
+    header h1 { margin: 0; font-size: 18px; }
+    header p { margin: 4px 0 0; font-size: 13px; color: #94a3b8; }
+    .url-row { padding: 12px 16px; border-bottom: 1px solid #1e293b; }
+    .url-row input { width: 100%; padding: 8px; border-radius: 6px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 13px; }
+    #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+    .msg { max-width: 80%; padding: 10px 14px; border-radius: 14px; line-height: 1.45; white-space: pre-wrap; }
+    .me { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 4px; }
+    .bot { align-self: flex-start; background: #1e293b; border-bottom-left-radius: 4px; }
+    .typing { font-style: italic; color: #94a3b8; }
+    form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #1e293b; }
+    #box { flex: 1; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #e2e8f0; font-size: 14px; }
+    button { padding: 10px 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff; font-size: 14px; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Support Agent</h1>
+      <p>Local demo page — talks to your /chat endpoint on AWS.</p>
+    </header>
+    <div class="url-row">
+      <input id="api" placeholder="Paste your API URL, e.g. https://XXXX.execute-api.us-east-1.amazonaws.com/prod" />
+    </div>
+    <div id="log">
+      <div class="msg bot">Hi! Ask me about password resets or API limits, or tell me to create a support ticket.</div>
+    </div>
+    <form id="form">
+      <input id="box" placeholder="Type a message..." autocomplete="off" />
+      <button id="send" type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    var EMAIL = "demo@example.com";
+    var log = document.getElementById("log");
+    var form = document.getElementById("form");
+    var box = document.getElementById("box");
+    var send = document.getElementById("send");
+    var api = document.getElementById("api");
+
+    function add(text, cls) {
+      var div = document.createElement("div");
+      div.className = "msg " + cls;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+      return div;
+    }
+
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var message = box.value.trim();
+      var url = api.value.trim().replace(/[/]+$/, "");
+      if (!message) return;
+      if (!url) { add("Paste your API URL in the box at the top first.", "bot"); return; }
+
+      add(message, "me");
+      box.value = "";
+      send.disabled = true;
+      var typing = add("typing...", "bot typing");
+
+      // No Content-Type header is set, so the browser sends the body as
+      // text/plain and treats this as a "simple" cross-origin request — it
+      // skips the CORS preflight. The Lambda json.loads the body regardless.
+      fetch(url + "/chat", {
+        method: "POST",
+        body: JSON.stringify({ message: message, customer_id: EMAIL })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          typing.remove();
+          add(data.response || JSON.stringify(data), "bot");
+        })
+        .catch(function (err) {
+          typing.remove();
+          add("Error: " + err.message + " — check the API URL is correct.", "bot");
+        })
+        .finally(function () {
+          send.disabled = false;
+          box.focus();
+        });
+    });
+  </script>
+</body>
+</html>
 '''
 
 # ── README.md (orientation for anyone who clones the repo directly) ─────────
