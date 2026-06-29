@@ -28,16 +28,15 @@ python-dotenv==1.2.2
 """
 
 # ── .env (filled in as the learner progresses) ─────────────────────────────
-FILES[".env"] = """\
+FILES[".env"] = '''\
 AWS_REGION=us-east-1
 TICKET_TABLE_NAME=support-tickets
 
 # Filled in as you complete each module:
 KNOWLEDGE_BASE_ID=
-MEMORY_ID=
 GUARDRAIL_ID=
 GUARDRAIL_VERSION=DRAFT
-"""
+'''
 
 # ── docs/product-guide.txt ─────────────────────────────────────────────────
 FILES["docs/product-guide.txt"] = """\
@@ -663,39 +662,19 @@ for result in response["retrievalResults"]:
     print("---")
 '''
 
-# ── scripts/create_memory.py ───────────────────────────────────────────────
-FILES["scripts/create_memory.py"] = '''\
-import boto3, os
-from dotenv import load_dotenv
-
-load_dotenv()
-REGION = os.getenv("AWS_REGION", "us-east-1")
-
-agentcore = boto3.client("bedrock-agentcore", region_name=REGION)
-
-response = agentcore.create_memory(
-    name="support-agent-memory",
-    description="Long-term memory for the support agent - stores customer plan, issues, and preferences",
-    memoryConfiguration={
-        "extractionConfiguration": {
-            "type": "SEMANTIC",
-        },
-        "retentionDays": 90,
-    },
-)
-
-memory_id = response["memoryId"]
-print(f"Memory store created: {memory_id}")
-print(f"Add to .env: MEMORY_ID={memory_id}")
-'''
-
 # ── test_memory.py (project root — imports agent.py) ───────────────────────
 FILES["test_memory.py"] = '''\
 import os
-from agent import build_agent   # lives at project root alongside this script
+from agent import build_agent, SESSION_BUCKET   # lives at project root alongside this script
 from dotenv import load_dotenv
 
 load_dotenv()
+
+if not SESSION_BUCKET:
+    raise SystemExit(
+        "DOCS_BUCKET is not set, so memory cannot persist to S3.\\n"
+        "Run 'source scripts/set-env.sh' in this terminal first, then re-run."
+    )
 
 CUSTOMER = "alice@example.com"
 
@@ -708,7 +687,7 @@ print("\\n=== Session 2 (new agent instance, same customer) ===")
 agent2 = build_agent(customer_id=CUSTOMER)
 r2 = agent2("Hi, any updates on my API issue?")
 print(f"Agent: {r2}")
-# The agent should recall Enterprise plan and rate limit context from Session 1
+# The agent should recall the Enterprise plan and rate limit context from Session 1
 '''
 
 # ── scripts/test_runner.py ─────────────────────────────────────────────────
@@ -853,7 +832,7 @@ FILES["README.md"] = """\
 # Support Agent Workshop — Starter
 
 Scaffold for the **Build an AI Customer Support Agent on AWS** workshop
-(Amazon Bedrock AgentCore + Claude).
+(Amazon Bedrock AgentCore + Claude/Qwen models).
 
 ## Quick start
 
